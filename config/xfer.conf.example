@@ -24,3 +24,8 @@ CAN_SSH_TO="laptop server"
 
 # Default rsync flags
 RSYNC_DEFAULT_FLAGS="-a -v -z --progress --partial --human-readable --protect-args"
+
+# Ceiling on how many items a single --mirror run may delete before it aborts.
+# Guards against a mistyped path or an unmounted source emptying a destination.
+# Override per-run with --max-delete <n>.
+MIRROR_MAX_DELETE="5000"

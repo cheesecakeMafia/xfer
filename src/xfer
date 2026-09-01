@@ -2,7 +2,7 @@
 set -u
 set -o pipefail
 
-VERSION="0.1.0"
+VERSION="0.2.0"
 DEFAULT_CONFIG_PATH="$HOME/.config/xfer/config"
 
 CONFIG_PATH="$DEFAULT_CONFIG_PATH"
@@ -24,6 +24,12 @@ QUIET=false
 NO_PROGRESS=false
 UPDATE=false
 GIT_IGNORE=false
+MIRROR=false
+MAX_DELETE=""
+MIRROR_MAX_DELETE_DEFAULT=5000
+ASSUME_YES=false
+FILTERED_FLAGS=()
+PREVIEW_CMD=()
 
 SOURCE_ENDPOINT=""
 DEST_ENDPOINT=""
@@ -359,6 +365,11 @@ load_config() {
     RSYNC_DEFAULT_FLAGS+=" --protect-args"
   fi
 
+  MIRROR_MAX_DELETE="${MIRROR_MAX_DELETE:-$MIRROR_MAX_DELETE_DEFAULT}"
+  if [[ ! "$MIRROR_MAX_DELETE" =~ ^[0-9]+$ ]]; then
+    die "Config error: MIRROR_MAX_DELETE must be a non-negative integer, got '$MIRROR_MAX_DELETE'"
+  fi
+
   read -r -a CAN_SSH_TO_ARR <<< "$CAN_SSH_TO"
 
   mkdir -p "$EXCLUDE_PROFILES_DIR" "$BOOKMARKS_DIR" "$DATA_DIR"
@@ -607,6 +618,10 @@ map_rsync_exit() {
       MAPPED_STATUS="PARTIAL"
       MAPPED_EXIT=23
       ;;
+    25)
+      MAPPED_STATUS="ABORTED"
+      MAPPED_EXIT=25
+      ;;
     *)
       MAPPED_STATUS="FAIL"
       MAPPED_EXIT=1
@@ -685,6 +700,9 @@ build_rsync_cmd() {
 
   [[ "$DRY_RUN" == true ]] && cmd+=(--dry-run)
   [[ "$UPDATE" == true ]] && cmd+=(--update)
+  if [[ "$MIRROR" == true ]]; then
+    cmd+=(--delete-after --max-delete="$(mirror_effective_ceiling)")
+  fi
   [[ "$QUIET" == true ]] && cmd+=(--quiet)
   [[ "$DRY_RUN" != true ]] && cmd+=(--stats)
 
@@ -720,6 +738,231 @@ print_verbose_command() {
 
   printf -v escaped '%q ' "${cmd[@]}"
   print_info "command: ${escaped% }"
+}
+
+# Returns 0 when the endpoint names a directory's *contents* rather than the
+# directory itself. rsync treats those two forms very differently: the contents
+# form makes the destination match the source exactly, deleting anything else
+# already there (sibling directories included).
+mirror_source_is_contents_copy() {
+  local endpoint="$1"
+  local prefix=""
+  local path=""
+  local base=""
+  local is_remote=false
+
+  [[ "$endpoint" == */ ]] && return 0
+
+  path="$endpoint"
+  if [[ "$endpoint" == *:* ]]; then
+    prefix="${endpoint%%:*}"
+    if [[ "$prefix" == "all" ]] || machine_exists "$prefix"; then
+      path="${endpoint#*:}"
+      is_remote=true
+    fi
+  fi
+
+  if [[ "$is_remote" == true ]]; then
+    # Mirror resolve_remote_spec: '~', '~/' and '' all normalize to '.' on the
+    # remote side. Expanding the local home here would be wrong.
+    path="$(normalize_remote_path "$path")"
+  else
+    path="$(expand_tilde "$path")"
+  fi
+
+  base="${path##*/}"
+  case "$base" in
+    ""|"."|"..") return 0 ;;
+  esac
+  return 1
+}
+
+mirror_guard_source() {
+  local endpoint="$1"
+
+  mirror_source_is_contents_copy "$endpoint" || return 0
+  [[ "$ASSUME_YES" == true ]] && return 0
+
+  die "--mirror refuses source '$endpoint': it names a directory's contents, not the directory itself. The destination would be made to match those contents, deleting everything else already there (sibling directories included). Drop the trailing '/', name the directory instead of '.', or pass --yes if that is genuinely what you want."
+}
+
+# Builds the dry-run command used to preview mirror deletions. Rebuilt from
+# BUILT_CMD rather than reused verbatim: --quiet suppresses itemized output
+# entirely, which would report zero deletions and silently skip the guard.
+mirror_build_preview_cmd() {
+  local arg=""
+  local stripped=""
+  local skip_next=false
+  local -a preview=()
+
+  for arg in "${BUILT_CMD[@]}"; do
+    if [[ "$skip_next" == true ]]; then
+      skip_next=false
+      preview+=("$arg")
+      continue
+    fi
+    case "$arg" in
+      -e)
+        skip_next=true
+        preview+=("$arg")
+        continue
+        ;;
+      --quiet|--msgs2stderr|--stats|--progress)
+        continue
+        ;;
+    esac
+    # A short-option cluster may carry a 'q' (-q, -aq, -avq). That silences
+    # itemized output exactly as --quiet does and would blind this guard.
+    if [[ "$arg" == -[a-zA-Z]* && "$arg" != --* ]]; then
+      stripped="${arg//q/}"
+      [[ "$stripped" == "-" ]] && continue
+      preview+=("$stripped")
+      continue
+    fi
+    preview+=("$arg")
+  done
+
+  preview+=(--dry-run --itemize-changes)
+
+  PREVIEW_CMD=("${preview[@]}")
+}
+
+mirror_effective_ceiling() {
+  printf '%s\n' "${MAX_DELETE:-${MIRROR_MAX_DELETE:-$MIRROR_MAX_DELETE_DEFAULT}}"
+}
+
+# Rewrites the --max-delete ceiling already present in BUILT_CMD so the real
+# run can never delete more than the preview showed and the user approved.
+mirror_bound_ceiling_to() {
+  local bound="$1"
+  local i=0
+
+  for i in "${!BUILT_CMD[@]}"; do
+    case "${BUILT_CMD[$i]}" in
+      --max-delete=*)
+        BUILT_CMD[$i]="--max-delete=$bound"
+        return 0
+        ;;
+    esac
+  done
+  return 1
+}
+
+# Previews what --mirror would delete and decides whether to proceed.
+# Returns 0 to continue, 25 when the ceiling stopped it, 1 otherwise.
+mirror_preview_and_confirm() {
+  local out=""
+  local err_file=""
+  local err_tail=""
+  local preview_exit=0
+  local count=0
+  local ceiling=""
+  local response=""
+
+  ceiling="$(mirror_effective_ceiling)"
+
+  mirror_build_preview_cmd
+
+  err_file="$(mktemp)"
+  out="$("${PREVIEW_CMD[@]}" 2>"$err_file")" || preview_exit=$?
+  err_tail="$(tail -n 1 "$err_file" 2>/dev/null)"
+  rm -f "$err_file"
+
+  case "$preview_exit" in
+    0|24)
+      ;;
+    25)
+      print_error "--mirror: deletions would reach the --max-delete ceiling ($ceiling). rsync deletes up to the ceiling before stopping, so a real run could remove up to $ceiling item(s) -- refusing to start it."
+      print_info "Re-run with --max-delete=N to raise the ceiling if this is expected."
+      return 25
+      ;;
+    *)
+      die "--mirror preview failed (rsync exit $preview_exit)${err_tail:+: $err_tail}. Refusing to mirror without a trustworthy preview."
+      ;;
+  esac
+
+  count="$(printf '%s\n' "$out" | grep -c '^\*deleting' || true)"
+
+  # Bound the real run to exactly what the preview showed. If files become
+  # extraneous between preview and run, the run stops at this bound rather
+  # than deleting more than was confirmed. count=0 means "delete nothing".
+  mirror_bound_ceiling_to "$count" || true
+
+  [[ "$count" -eq 0 ]] && return 0
+
+  print_warn "--mirror will delete $count item(s) at the destination:"
+  printf '%s\n' "$out" | grep '^\*deleting' | head -20 | sed 's/^/  /'
+  [[ "$count" -gt 20 ]] && print_info "  ... and $((count - 20)) more"
+
+  if [[ "$ASSUME_YES" == true ]]; then
+    print_info "--yes given; proceeding without confirmation."
+    return 0
+  fi
+
+  if [[ ! -t 0 ]]; then
+    die "--mirror refuses to delete $count item(s) unattended (no TTY). Re-run with --yes if this is intended."
+  fi
+
+  printf 'Continue? [y/N] '
+  read -r response
+  case "$response" in
+    y|Y|yes|YES) return 0 ;;
+    *) print_info "Mirror cancelled."; return 1 ;;
+  esac
+}
+
+# Filters stored flags before a replay. Always drops --yes so a replay
+# re-previews and re-confirms. In "undo" mode also drops the mirror flags:
+# undo swaps the endpoints, so a replayed --mirror would delete the original
+# source. Values of --exclude/-ep are skipped so a pattern that happens to be
+# spelled like a flag is not mistaken for one.
+filter_replay_flags() {
+  local mode="$1"
+  shift
+  local -a out=()
+  local keep_next=false
+  local drop_next=false
+  local arg=""
+
+  for arg in "$@"; do
+    if [[ "$keep_next" == true ]]; then
+      keep_next=false
+      out+=("$arg")
+      continue
+    fi
+    if [[ "$drop_next" == true ]]; then
+      drop_next=false
+      continue
+    fi
+    case "$arg" in
+      --exclude|-ep|--exclude-profile)
+        keep_next=true
+        out+=("$arg")
+        continue
+        ;;
+      -y|--yes)
+        continue
+        ;;
+    esac
+    if [[ "$mode" == "undo" ]]; then
+      case "$arg" in
+        --mirror|--max-delete=*)
+          continue
+          ;;
+        --max-delete)
+          drop_next=true
+          continue
+          ;;
+      esac
+    fi
+    out+=("$arg")
+  done
+
+  if [[ ${#out[@]} -gt 0 ]]; then
+    FILTERED_FLAGS=("${out[@]}")
+  else
+    FILTERED_FLAGS=()
+  fi
 }
 
 execute_transfer_pair() {
@@ -819,6 +1062,10 @@ execute_transfer_pair() {
     print_verbose_command "${BUILT_CMD[@]}"
   fi
 
+  if [[ "$MIRROR" == true && "$DRY_RUN" != true ]]; then
+    mirror_preview_and_confirm || return $?
+  fi
+
   rsync_log="$(mktemp)"
   start_time="$(date +%s)"
   if [[ "$QUIET" == true ]]; then
@@ -850,6 +1097,10 @@ execute_transfer_pair() {
     PARTIAL)
       print_warn "status=PARTIAL (rsync exit 23) files=$STATS_FILES bytes=$STATS_BYTES duration=${duration}s"
       ;;
+    ABORTED)
+      print_error "status=ABORTED (rsync exit 25): --max-delete ceiling reached. rsync deletes up to the ceiling before stopping, so some deletions may already have been applied -- check the destination before re-running."
+      print_info "Re-run with --max-delete=N to raise the ceiling if this deletion count is expected."
+      ;;
     FAIL)
       print_error "status=FAIL (rsync exit $rsync_exit) files=$STATS_FILES bytes=$STATS_BYTES duration=${duration}s"
       ;;
@@ -867,6 +1118,9 @@ parse_transfer_args() {
   NO_PROGRESS=false
   UPDATE=false
   GIT_IGNORE=false
+  MIRROR=false
+  MAX_DELETE=""
+  ASSUME_YES=false
   EXCLUDES=()
   EXCLUDE_PROFILES=()
   TRANSFER_RAW_FLAGS=()
@@ -895,6 +1149,27 @@ parse_transfer_args() {
         ;;
       --update)
         UPDATE=true
+        TRANSFER_RAW_FLAGS+=("$1")
+        ;;
+      --mirror)
+        MIRROR=true
+        TRANSFER_RAW_FLAGS+=("$1")
+        ;;
+      --max-delete)
+        [[ $# -ge 2 ]] || die "--max-delete requires a value"
+        [[ "$2" =~ ^[0-9]+$ ]] || die "--max-delete requires a non-negative integer, got '$2'"
+        MAX_DELETE="$2"
+        TRANSFER_RAW_FLAGS+=("$1" "$2")
+        shift
+        ;;
+      --max-delete=*)
+        MAX_DELETE="${1#*=}"
+        [[ -n "$MAX_DELETE" ]] || die "--max-delete requires a value"
+        [[ "$MAX_DELETE" =~ ^[0-9]+$ ]] || die "--max-delete requires a non-negative integer, got '$MAX_DELETE'"
+        TRANSFER_RAW_FLAGS+=("$1")
+        ;;
+      -y|--yes)
+        ASSUME_YES=true
         TRANSFER_RAW_FLAGS+=("$1")
         ;;
       --git)
@@ -964,6 +1239,10 @@ cmd_transfer() {
   ensure_runtime_requirements
   parse_transfer_args "$@"
 
+  if [[ "$MIRROR" == true ]]; then
+    mirror_guard_source "$SOURCE_ENDPOINT"
+  fi
+
   parse_endpoint "$SOURCE_ENDPOINT"
   src_kind="$PARSED_KIND"
 
@@ -976,6 +1255,7 @@ cmd_transfer() {
   dst_path="$PARSED_PATH"
 
   if [[ "$dst_kind" == "multi" ]]; then
+    [[ "$MIRROR" != true ]] || die "--mirror cannot target a broadcast destination (all: or m1,m2:). Mirroring deletes files at the destination; run it against one machine at a time."
     [[ "$src_kind" == "local" ]] || die "Broadcast destination requires a local source"
     targets=("${PARSED_TARGETS[@]}")
 
@@ -1022,6 +1302,9 @@ Transfer flags:
   -ep, --exclude-profile <name> Use a named exclude profile (repeatable)
   --progress / --no-progress    Toggle progress output (default: progress on)
   --update                      Skip files newer on destination
+  --mirror                      Make the destination match the source, deleting extras
+  --max-delete <n>              Ceiling on --mirror deletions (default: MIRROR_MAX_DELETE, 5000)
+  -y, --yes                     Skip the mirror confirmation prompt (required when not on a TTY)
   -v, --verbose                 Show the rsync command
   -q, --quiet                   Suppress output except errors
   -h, --help                    Show transfer help
@@ -1031,6 +1314,20 @@ Endpoint format:
   machine:path                  Remote
   all:path                      Broadcast destination to all other machines
   m1,m2:path                    Broadcast destination to listed machines
+
+Mirror mode (--mirror):
+  Makes the destination match the source exactly. Extra files at the
+  destination are DELETED OUTRIGHT - there is no attic and no undo.
+  Guards, all of which must be satisfied:
+    - refuses a source naming a directory's contents ('dir/', '.', 'm:~');
+      pass --yes to override
+    - refuses a broadcast destination (all: or m1,m2:); --yes does NOT override
+    - previews deletions and asks; off a TTY it refuses without --yes
+    - aborts if more than --max-delete items would go (rsync exit 25,
+      reported as ABORTED). The preview stops the run before it starts;
+      note rsync itself deletes up to the ceiling before stopping
+  'xfer undo' never mirrors, and replays via 'last'/'bookmark run' always
+  re-ask, since the stored --yes is dropped.
 
 Notes:
   - all: is not valid as a source
@@ -1078,6 +1375,9 @@ Transfer flags:
   --exclude <pattern>
   -ep, --exclude-profile <name>
   --progress / --no-progress
+  --mirror
+  --max-delete <n>
+  -y, --yes
   -v, --verbose
   -q, --quiet
 
@@ -1530,7 +1830,8 @@ cmd_last() {
   fi
 
   print_info "Repeating last transfer: $src -> $dst"
-  cmd_transfer "${DECODED_FLAGS[@]}" "$src" "$dst"
+  filter_replay_flags replay "${DECODED_FLAGS[@]}"
+  cmd_transfer "${FILTERED_FLAGS[@]}" "$src" "$dst"
 }
 
 cmd_undo() {
@@ -1582,7 +1883,8 @@ cmd_undo() {
       ;;
   esac
 
-  cmd_transfer "${DECODED_FLAGS[@]}" --update "$dst" "$src"
+  filter_replay_flags undo "${DECODED_FLAGS[@]}"
+  cmd_transfer "${FILTERED_FLAGS[@]}" --update "$dst" "$src"
 }
 
 doctor_ensure_dir() {
@@ -2016,7 +2318,8 @@ cmd_bookmark_run() {
   fi
 
   print_info "Running bookmark '$name': $src -> $dst"
-  cmd_transfer "${DECODED_FLAGS[@]}" "$src" "$dst"
+  filter_replay_flags replay "${DECODED_FLAGS[@]}"
+  cmd_transfer "${FILTERED_FLAGS[@]}" "$src" "$dst"
 }
 
 cmd_bookmark_list() {

@@ -240,6 +240,7 @@ write_config() {
     printf 'THIS_MACHINE="%s"\n' "$THIS_MACHINE"
     printf 'CAN_SSH_TO="%s"\n' "$CAN_SSH_TO"
     printf 'RSYNC_DEFAULT_FLAGS="-a -v -z --progress --partial --human-readable --protect-args"\n'
+    printf 'MIRROR_MAX_DELETE="5000"\n'
   } > "$CONFIG_FILE"
 
   chmod 600 "$CONFIG_FILE"

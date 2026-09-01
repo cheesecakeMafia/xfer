@@ -7,3 +7,7 @@ project_plan.md
 *.key
 *.p12
 *.pfx
+
+# Local working notes (design briefs, ADRs, implementation plans)
+docs/
+plans/

@@ -1,0 +1,26 @@
+# xfer example config
+
+# All known machines in your topology
+MACHINES=(workstation laptop server)
+
+# Per-machine SSH settings
+workstation_user="alice"
+workstation_ip=""
+workstation_ssh_key=""
+
+laptop_user="bob"
+laptop_ip="100.64.0.2"
+laptop_ssh_key="~/.ssh/id_ed25519"
+
+server_user="charlie"
+server_ip="100.64.0.3"
+server_ssh_key="~/.ssh/id_ed25519"
+
+# This host's machine name
+THIS_MACHINE="workstation"
+
+# Machines this host can reach over SSH
+CAN_SSH_TO="laptop server"
+
+# Default rsync flags
+RSYNC_DEFAULT_FLAGS="-a -v -z --progress --partial --human-readable --protect-args"

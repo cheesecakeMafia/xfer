@@ -1,0 +1,2150 @@
+#!/usr/bin/env bash
+set -u
+set -o pipefail
+
+VERSION="0.1.0"
+DEFAULT_CONFIG_PATH="$HOME/.config/xfer/config"
+
+CONFIG_PATH="$DEFAULT_CONFIG_PATH"
+CONFIG_DIR=""
+EXCLUDE_PROFILES_DIR=""
+DATA_DIR=""
+BOOKMARKS_DIR=""
+HISTORY_FILE=""
+
+THIS_MACHINE=""
+CAN_SSH_TO=""
+CAN_SSH_TO_ARR=()
+MACHINES=()
+RSYNC_DEFAULT_FLAGS=""
+
+DRY_RUN=false
+VERBOSE=false
+QUIET=false
+NO_PROGRESS=false
+UPDATE=false
+GIT_IGNORE=false
+
+SOURCE_ENDPOINT=""
+DEST_ENDPOINT=""
+TRANSFER_RAW_FLAGS=()
+EXCLUDES=()
+EXCLUDE_PROFILES=()
+GIT_EXCLUDE_FROM_FILE=""
+
+ARGS=()
+PARSED_KIND=""
+PARSED_MACHINE=""
+PARSED_PATH=""
+PARSED_TARGETS=()
+BUILT_CMD=()
+DECODED_FLAGS=()
+MAPPED_STATUS=""
+MAPPED_EXIT=0
+STATS_FILES="-"
+STATS_BYTES="-"
+DOCTOR_TOTAL=0
+DOCTOR_OK=0
+DOCTOR_FAIL=0
+DOCTOR_WARN=0
+DOCTOR_FIXED=0
+
+C_RESET=""
+C_RED=""
+C_GREEN=""
+C_YELLOW=""
+C_BLUE=""
+
+setup_colors() {
+  if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+    C_RESET=$'\033[0m'
+    C_RED=$'\033[31m'
+    C_GREEN=$'\033[32m'
+    C_YELLOW=$'\033[33m'
+    C_BLUE=$'\033[34m'
+  fi
+}
+
+print_info() {
+  [[ "$QUIET" == true ]] && return 0
+  printf '%sxfer:%s %s\n' "$C_BLUE" "$C_RESET" "$*"
+}
+
+print_warn() {
+  printf '%sxfer:%s %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2
+}
+
+print_error() {
+  printf '%sxfer:%s %s\n' "$C_RED" "$C_RESET" "$*" >&2
+}
+
+die() {
+  print_error "$*"
+  if [[ -n "${GIT_EXCLUDE_FROM_FILE:-}" && -f "${GIT_EXCLUDE_FROM_FILE:-}" ]]; then
+    rm -f "$GIT_EXCLUDE_FROM_FILE" 2>/dev/null || true
+  fi
+  exit 1
+}
+
+expand_tilde() {
+  local path="$1"
+  if [[ "$path" == "~" ]]; then
+    printf '%s\n' "$HOME"
+    return
+  fi
+  if [[ "$path" == "~/"* ]]; then
+    printf '%s\n' "$HOME/${path#"~/"}"
+    return
+  fi
+  printf '%s\n' "$path"
+}
+
+available_machines_csv() {
+  local joined=""
+  local machine
+  for machine in "${MACHINES[@]}"; do
+    if [[ -n "$joined" ]]; then
+      joined+=" "
+    fi
+    joined+="$machine"
+  done
+  printf '%s\n' "$joined"
+}
+
+available_exclude_profiles_csv() {
+  local profile_file=""
+  local profile_name=""
+  local joined=""
+  local had_nullglob=0
+
+  if shopt -q nullglob; then
+    had_nullglob=1
+  fi
+  shopt -s nullglob
+
+  for profile_file in "$EXCLUDE_PROFILES_DIR"/*; do
+    [[ -f "$profile_file" ]] || continue
+    profile_name="$(basename "$profile_file")"
+    if [[ -n "$joined" ]]; then
+      joined+=" "
+    fi
+    joined+="$profile_name"
+  done
+
+  if [[ "$had_nullglob" -eq 0 ]]; then
+    shopt -u nullglob
+  fi
+
+  if [[ -z "$joined" ]]; then
+    printf '<none>\n'
+  else
+    printf '%s\n' "$joined"
+  fi
+}
+
+require_cmd() {
+  local cmd="$1"
+  command -v "$cmd" >/dev/null 2>&1 || die "Required command not found: $cmd"
+}
+
+command_exists() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+ensure_runtime_requirements() {
+  require_cmd rsync
+  require_cmd ssh
+  require_cmd flock
+  require_cmd base64
+}
+
+machine_exists() {
+  local candidate="$1"
+  local machine
+  for machine in "${MACHINES[@]}"; do
+    if [[ "$machine" == "$candidate" ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+machine_reachable() {
+  local candidate="$1"
+  local machine
+  for machine in "${CAN_SSH_TO_ARR[@]}"; do
+    if [[ "$machine" == "$candidate" ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+machine_field() {
+  local machine="$1"
+  local field="$2"
+  local var_name="${machine}_${field}"
+  printf '%s\n' "${!var_name:-}"
+}
+
+normalize_remote_path() {
+  local path="$1"
+  if [[ -z "$path" || "$path" == "~" || "$path" == "~/" ]]; then
+    printf '.\n'
+    return
+  fi
+  if [[ "$path" == "~/"* ]]; then
+    printf '%s\n' "${path#"~/"}"
+    return
+  fi
+  printf '%s\n' "$path"
+}
+
+gitignore_write_exclude_file_from_stdin() {
+  local tmp_file=""
+  local line=""
+  local trimmed=""
+  local had_pattern=false
+
+  tmp_file="$(mktemp)"
+  chmod 600 "$tmp_file" 2>/dev/null || true
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    # Handle CRLF files gracefully.
+    line="${line%$'\r'}"
+
+    trimmed="${line#"${line%%[!$' \t']*}"}"
+    [[ -n "$trimmed" ]] || continue
+
+    # Comment lines: first non-whitespace is '#'. Allow '\#' as a literal pattern.
+    if [[ "${trimmed:0:1}" == "#" ]]; then
+      continue
+    fi
+
+    # Negation is not supported: first non-whitespace is '!'. Allow '\!' as a literal pattern.
+    if [[ "${trimmed:0:1}" == "!" ]]; then
+      rm -f "$tmp_file" 2>/dev/null || true
+      die "Unsupported .gitignore negation pattern found ('!'). Remove lines starting with '!'."
+    fi
+
+    printf '%s\n' "$line" >>"$tmp_file"
+    had_pattern=true
+  done
+
+  if [[ "$had_pattern" != true ]]; then
+    rm -f "$tmp_file" 2>/dev/null || true
+    printf '\n'
+    return 0
+  fi
+
+  printf '%s\n' "$tmp_file"
+}
+
+gitignore_prepare_exclude_file_local() {
+  local gitignore_path="$1"
+  [[ -f "$gitignore_path" ]] || { printf '\n'; return 0; }
+  [[ -r "$gitignore_path" ]] || die "Cannot read .gitignore: $gitignore_path"
+  gitignore_write_exclude_file_from_stdin <"$gitignore_path"
+}
+
+remote_gitignore_file_for_cat() {
+  local raw_dir="$1"
+  local dir=""
+  local file=""
+
+  dir="$(normalize_remote_path "$raw_dir")"
+  dir="${dir%/}"
+
+  if [[ "$dir" == "." ]]; then
+    file=".gitignore"
+  else
+    file="$dir/.gitignore"
+  fi
+
+  # Quote as a single token for the remote shell.
+  printf '%q\n' "$file"
+}
+
+fetch_remote_gitignore() {
+  local machine="$1"
+  local raw_dir="$2"
+  local user=""
+  local ip=""
+  local key=""
+  local safe_file=""
+  local -a ssh_cmd=()
+
+  user="$(machine_field "$machine" user)"
+  ip="$(machine_field "$machine" ip)"
+  key="$(resolve_ssh_key "$machine")"
+
+  [[ -n "$user" ]] || die "Missing config value: ${machine}_user"
+  [[ -n "$ip" ]] || die "Missing config value: ${machine}_ip"
+
+  ssh_cmd=(ssh -o BatchMode=yes -o ConnectTimeout=5)
+  if [[ -n "$key" ]]; then
+    [[ -f "$key" ]] || die "SSH key not found for '$machine': $key"
+    ssh_cmd+=(-i "$key")
+  fi
+  ssh_cmd+=("$user@$ip")
+
+  safe_file="$(remote_gitignore_file_for_cat "$raw_dir")"
+
+  # Missing file should be a no-op (empty output). SSH failure should be an error.
+  "${ssh_cmd[@]}" "if [ -f $safe_file ]; then cat -- $safe_file; fi"
+}
+
+resolve_remote_spec() {
+  local machine="$1"
+  local path="$2"
+  local user
+  local ip
+
+  user="$(machine_field "$machine" user)"
+  ip="$(machine_field "$machine" ip)"
+
+  [[ -n "$user" ]] || die "Missing config value: ${machine}_user"
+  [[ -n "$ip" ]] || die "Missing config value: ${machine}_ip"
+
+  printf '%s@%s:%s\n' "$user" "$ip" "$(normalize_remote_path "$path")"
+}
+
+resolve_ssh_key() {
+  local machine="$1"
+  local key
+  key="$(machine_field "$machine" ssh_key)"
+  if [[ -z "$key" ]]; then
+    printf '\n'
+    return
+  fi
+
+  # Normalize common accidental form: "$HOME/~/.ssh/key" -> "$HOME/.ssh/key"
+  if [[ "$key" == "$HOME/~/"* ]]; then
+    key="$HOME/${key#"$HOME/~/"}"
+  fi
+
+  expand_tilde "$key"
+}
+
+load_config() {
+  local expanded
+
+  expanded="$(expand_tilde "$CONFIG_PATH")"
+  CONFIG_PATH="$expanded"
+
+  [[ -f "$CONFIG_PATH" ]] || die "Config not found at '$CONFIG_PATH'. Run ./install.sh first or use --config <path>."
+
+  # shellcheck disable=SC1090
+  source "$CONFIG_PATH"
+
+  if [[ ${#MACHINES[@]} -eq 0 ]]; then
+    die "Config error: MACHINES is empty"
+  fi
+  [[ -n "${THIS_MACHINE:-}" ]] || die "Config error: THIS_MACHINE is not set"
+  [[ -n "${CAN_SSH_TO:-}" ]] || die "Config error: CAN_SSH_TO is not set"
+
+  machine_exists "$THIS_MACHINE" || die "Config error: THIS_MACHINE '$THIS_MACHINE' is not in MACHINES"
+
+  CONFIG_DIR="$(dirname "$CONFIG_PATH")"
+  CONFIG_DIR="$(expand_tilde "$CONFIG_DIR")"
+  EXCLUDE_PROFILES_DIR="$CONFIG_DIR/exclude-profiles"
+  BOOKMARKS_DIR="$CONFIG_DIR/bookmarks"
+
+  DATA_DIR="${DATA_DIR:-$HOME/.local/share/xfer}"
+  DATA_DIR="$(expand_tilde "$DATA_DIR")"
+  HISTORY_FILE="$DATA_DIR/history.log"
+
+  RSYNC_DEFAULT_FLAGS="${RSYNC_DEFAULT_FLAGS:--a -v -z --progress --partial --human-readable --protect-args}"
+  if [[ " $RSYNC_DEFAULT_FLAGS " != *" --protect-args "* && " $RSYNC_DEFAULT_FLAGS " != *" -s "* ]]; then
+    RSYNC_DEFAULT_FLAGS+=" --protect-args"
+  fi
+
+  read -r -a CAN_SSH_TO_ARR <<< "$CAN_SSH_TO"
+
+  mkdir -p "$EXCLUDE_PROFILES_DIR" "$BOOKMARKS_DIR" "$DATA_DIR"
+}
+
+doctor_reset_counters() {
+  DOCTOR_TOTAL=0
+  DOCTOR_OK=0
+  DOCTOR_FAIL=0
+  DOCTOR_WARN=0
+  DOCTOR_FIXED=0
+}
+
+doctor_ok() {
+  DOCTOR_TOTAL=$((DOCTOR_TOTAL + 1))
+  DOCTOR_OK=$((DOCTOR_OK + 1))
+  printf '%s[OK]%s %s\n' "$C_GREEN" "$C_RESET" "$1"
+}
+
+doctor_warn() {
+  DOCTOR_TOTAL=$((DOCTOR_TOTAL + 1))
+  DOCTOR_WARN=$((DOCTOR_WARN + 1))
+  printf '%s[WARN]%s %s\n' "$C_YELLOW" "$C_RESET" "$1"
+}
+
+doctor_fail_msg() {
+  DOCTOR_TOTAL=$((DOCTOR_TOTAL + 1))
+  DOCTOR_FAIL=$((DOCTOR_FAIL + 1))
+  printf '%s[FAIL]%s %s\n' "$C_RED" "$C_RESET" "$1"
+}
+
+doctor_fixed() {
+  DOCTOR_TOTAL=$((DOCTOR_TOTAL + 1))
+  DOCTOR_FIXED=$((DOCTOR_FIXED + 1))
+  printf '%s[FIXED]%s %s\n' "$C_GREEN" "$C_RESET" "$1"
+}
+
+doctor_config_paths_from_config_path() {
+  local expanded_path=""
+  expanded_path="$(expand_tilde "$CONFIG_PATH")"
+  CONFIG_PATH="$expanded_path"
+  CONFIG_DIR="$(dirname "$CONFIG_PATH")"
+  EXCLUDE_PROFILES_DIR="$CONFIG_DIR/exclude-profiles"
+  BOOKMARKS_DIR="$CONFIG_DIR/bookmarks"
+}
+
+doctor_try_load_config() {
+  local expanded=""
+  local source_rc=0
+
+  expanded="$(expand_tilde "$CONFIG_PATH")"
+  CONFIG_PATH="$expanded"
+
+  if [[ ! -f "$CONFIG_PATH" ]]; then
+    return 1
+  fi
+
+  set +u
+  # shellcheck disable=SC1090
+  source "$CONFIG_PATH" || source_rc=$?
+  set -u
+  if [[ "$source_rc" -ne 0 ]]; then
+    return 1
+  fi
+
+  if ! declare -p MACHINES >/dev/null 2>&1; then
+    return 1
+  fi
+  [[ ${#MACHINES[@]} -gt 0 ]] || return 1
+  [[ -n "${THIS_MACHINE:-}" ]] || return 1
+  [[ -n "${CAN_SSH_TO:-}" ]] || return 1
+
+  if ! machine_exists "$THIS_MACHINE"; then
+    return 1
+  fi
+
+  CONFIG_DIR="$(dirname "$CONFIG_PATH")"
+  EXCLUDE_PROFILES_DIR="$CONFIG_DIR/exclude-profiles"
+  BOOKMARKS_DIR="$CONFIG_DIR/bookmarks"
+  DATA_DIR="${DATA_DIR:-$HOME/.local/share/xfer}"
+  DATA_DIR="$(expand_tilde "$DATA_DIR")"
+  HISTORY_FILE="$DATA_DIR/history.log"
+
+  RSYNC_DEFAULT_FLAGS="${RSYNC_DEFAULT_FLAGS:--a -v -z --progress --partial --human-readable --protect-args}"
+  if [[ " $RSYNC_DEFAULT_FLAGS " != *" --protect-args "* && " $RSYNC_DEFAULT_FLAGS " != *" -s "* ]]; then
+    RSYNC_DEFAULT_FLAGS+=" --protect-args"
+  fi
+
+  read -r -a CAN_SSH_TO_ARR <<< "$CAN_SSH_TO"
+  return 0
+}
+
+extract_global_options() {
+  local -a filtered=()
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --config)
+        shift
+        [[ $# -gt 0 ]] || die "--config requires a value"
+        CONFIG_PATH="$1"
+        ;;
+      --config=*)
+        CONFIG_PATH="${1#*=}"
+        ;;
+      *)
+        filtered+=("$1")
+        ;;
+    esac
+    shift || true
+  done
+
+  ARGS=("${filtered[@]}")
+}
+
+parse_endpoint() {
+  local endpoint="$1"
+  local prefix=""
+  local rest=""
+  local machine=""
+  local -A seen_targets=()
+  local -a raw_targets=()
+
+  PARSED_KIND=""
+  PARSED_MACHINE=""
+  PARSED_PATH=""
+  PARSED_TARGETS=()
+
+  if [[ "$endpoint" == /* || "$endpoint" == ./* || "$endpoint" == ~* ]]; then
+    PARSED_KIND="local"
+    PARSED_PATH="$endpoint"
+    return
+  fi
+
+  if [[ "$endpoint" != *:* ]]; then
+    PARSED_KIND="local"
+    PARSED_PATH="$endpoint"
+    return
+  fi
+
+  prefix="${endpoint%%:*}"
+  rest="${endpoint#*:}"
+
+  if [[ "$prefix" == "all" ]]; then
+    PARSED_KIND="multi"
+    PARSED_PATH="$rest"
+
+    if [[ ${#CAN_SSH_TO_ARR[@]} -gt 0 ]]; then
+      for machine in "${CAN_SSH_TO_ARR[@]}"; do
+        machine_exists "$machine" || die "Config error: CAN_SSH_TO references unknown machine '$machine'"
+        if [[ -z "${seen_targets[$machine]:-}" ]]; then
+          PARSED_TARGETS+=("$machine")
+          seen_targets[$machine]=1
+        fi
+      done
+    else
+      for machine in "${MACHINES[@]}"; do
+        if [[ "$machine" != "$THIS_MACHINE" ]]; then
+          PARSED_TARGETS+=("$machine")
+        fi
+      done
+    fi
+    return
+  fi
+
+  if [[ "$prefix" == *,* ]]; then
+    IFS=',' read -r -a raw_targets <<< "$prefix"
+    for machine in "${raw_targets[@]}"; do
+      [[ -n "$machine" ]] || die "Invalid multi-target endpoint: '$endpoint'"
+      machine_exists "$machine" || die "Unknown machine '$machine'. Available: $(available_machines_csv)"
+      if [[ -z "${seen_targets[$machine]:-}" ]]; then
+        PARSED_TARGETS+=("$machine")
+        seen_targets[$machine]=1
+      fi
+    done
+    PARSED_KIND="multi"
+    PARSED_PATH="$rest"
+    return
+  fi
+
+  if machine_exists "$prefix"; then
+    PARSED_KIND="remote"
+    PARSED_MACHINE="$prefix"
+    PARSED_PATH="$rest"
+    return
+  fi
+
+  die "Unknown machine prefix '$prefix'. Use ./, /, or ~ for local paths with ':'. Available machines: $(available_machines_csv)"
+}
+
+encode_flags_b64() {
+  if [[ $# -eq 0 ]]; then
+    printf '\n'
+    return
+  fi
+  printf '%s\0' "$@" | base64 -w0
+  printf '\n'
+}
+
+decode_flags_b64_to_array() {
+  local encoded="$1"
+  DECODED_FLAGS=()
+
+  if [[ -z "$encoded" ]]; then
+    return 0
+  fi
+
+  if ! mapfile -d '' -t DECODED_FLAGS < <(printf '%s' "$encoded" | base64 -d 2>/dev/null); then
+    return 1
+  fi
+
+  return 0
+}
+
+decode_flags_b64_pretty() {
+  local encoded="$1"
+  local pretty=""
+
+  if [[ -z "$encoded" ]]; then
+    printf '\n'
+    return 0
+  fi
+
+  if ! decode_flags_b64_to_array "$encoded"; then
+    printf '<invalid-flags>\n'
+    return 1
+  fi
+
+  if [[ ${#DECODED_FLAGS[@]} -eq 0 ]]; then
+    printf '\n'
+    return 0
+  fi
+
+  printf -v pretty '%q ' "${DECODED_FLAGS[@]}"
+  printf '%s\n' "${pretty% }"
+}
+
+map_rsync_exit() {
+  local rsync_exit="$1"
+  case "$rsync_exit" in
+    0|24)
+      MAPPED_STATUS="OK"
+      MAPPED_EXIT=0
+      ;;
+    23)
+      MAPPED_STATUS="PARTIAL"
+      MAPPED_EXIT=23
+      ;;
+    *)
+      MAPPED_STATUS="FAIL"
+      MAPPED_EXIT=1
+      ;;
+  esac
+}
+
+record_history() {
+  local status="$1"
+  local src="$2"
+  local dst="$3"
+  local files="$4"
+  local bytes="$5"
+  local duration="$6"
+  local flags_b64="$7"
+  local timestamp
+
+  timestamp="$(date -Iseconds)"
+
+  (
+    flock -x 200
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$timestamp" "$status" "$src" "$dst" "$files" "$bytes" "$duration" "$flags_b64" \
+      >> "$HISTORY_FILE"
+  ) 200>"$DATA_DIR/history.log.lock"
+}
+
+extract_transfer_stats() {
+  local stats_file="$1"
+  local files_line=""
+  local bytes_line=""
+
+  STATS_FILES="-"
+  STATS_BYTES="-"
+
+  files_line="$(sed -n 's/^Number of regular files transferred: \([0-9][0-9,]*\)$/\1/p' "$stats_file" | tail -n 1)"
+  if [[ -z "$files_line" ]]; then
+    files_line="$(sed -n 's/^Number of files transferred: \([0-9][0-9,]*\)$/\1/p' "$stats_file" | tail -n 1)"
+  fi
+  if [[ -n "$files_line" ]]; then
+    STATS_FILES="${files_line//,/}"
+  fi
+
+  bytes_line="$(sed -n 's/^Total transferred file size: \(.*\)$/\1/p' "$stats_file" | tail -n 1)"
+  if [[ -z "$bytes_line" ]]; then
+    bytes_line="$(sed -n 's/^Total file size: \(.*\)$/\1/p' "$stats_file" | tail -n 1)"
+  fi
+  if [[ -n "$bytes_line" ]]; then
+    STATS_BYTES="$bytes_line"
+  fi
+}
+
+build_rsync_cmd() {
+  local remote_machine="$1"
+  local resolved_source="$2"
+  local resolved_destination="$3"
+  local ssh_key=""
+  local profile=""
+  local profile_path=""
+  local pattern=""
+  local arg=""
+  local -a cmd=(rsync)
+  local -a default_flags=()
+
+  read -r -a default_flags <<< "$RSYNC_DEFAULT_FLAGS"
+  cmd+=("${default_flags[@]}")
+
+  if [[ "$NO_PROGRESS" == true ]]; then
+    local -a filtered=()
+    for arg in "${cmd[@]}"; do
+      [[ "$arg" == "--progress" ]] && continue
+      filtered+=("$arg")
+    done
+    cmd=("${filtered[@]}")
+  fi
+
+  [[ "$DRY_RUN" == true ]] && cmd+=(--dry-run)
+  [[ "$UPDATE" == true ]] && cmd+=(--update)
+  [[ "$QUIET" == true ]] && cmd+=(--quiet)
+  [[ "$DRY_RUN" != true ]] && cmd+=(--stats)
+
+  if [[ "$GIT_IGNORE" == true && -n "${GIT_EXCLUDE_FROM_FILE:-}" ]]; then
+    cmd+=(--exclude-from="$GIT_EXCLUDE_FROM_FILE")
+  fi
+
+  for profile in "${EXCLUDE_PROFILES[@]}"; do
+    profile_path="$EXCLUDE_PROFILES_DIR/$profile"
+    [[ -f "$profile_path" ]] || die "Exclude profile not found: $profile. Available profiles: $(available_exclude_profiles_csv)"
+    cmd+=(--exclude-from="$profile_path")
+  done
+
+  for pattern in "${EXCLUDES[@]}"; do
+    cmd+=(--exclude="$pattern")
+  done
+
+  if [[ -n "$remote_machine" ]]; then
+    ssh_key="$(resolve_ssh_key "$remote_machine")"
+    if [[ -n "$ssh_key" ]]; then
+      [[ -f "$ssh_key" ]] || die "SSH key not found for '$remote_machine': $ssh_key"
+      cmd+=(-e "ssh -i $ssh_key")
+    fi
+  fi
+
+  cmd+=("$resolved_source" "$resolved_destination")
+  BUILT_CMD=("${cmd[@]}")
+}
+
+print_verbose_command() {
+  local -a cmd=("$@")
+  local escaped=""
+
+  printf -v escaped '%q ' "${cmd[@]}"
+  print_info "command: ${escaped% }"
+}
+
+execute_transfer_pair() {
+  local source="$1"
+  local destination="$2"
+  local src_kind=""
+  local src_machine=""
+  local src_path=""
+  local dst_kind=""
+  local dst_machine=""
+  local dst_path=""
+  local resolved_source=""
+  local resolved_destination=""
+  local remote_machine=""
+  local direction=""
+  local start_time=0
+  local end_time=0
+  local duration=0
+  local flags_b64=""
+  local rsync_exit=0
+  local rsync_log=""
+  local gitignore_path=""
+  local root_dir=""
+  local remote_gitignore_content=""
+  local cleanup_git_exclude=false
+
+  parse_endpoint "$source"
+  src_kind="$PARSED_KIND"
+  src_machine="$PARSED_MACHINE"
+  src_path="$PARSED_PATH"
+
+  parse_endpoint "$destination"
+  dst_kind="$PARSED_KIND"
+  dst_machine="$PARSED_MACHINE"
+  dst_path="$PARSED_PATH"
+
+  if [[ "$src_kind" == "multi" ]]; then
+    die "Cannot pull from all machines at once"
+  fi
+
+  if [[ "$dst_kind" == "multi" ]]; then
+    die "Internal error: execute_transfer_pair does not accept multi-target destination"
+  fi
+
+  if [[ "$src_kind" == "remote" && "$dst_kind" == "remote" ]]; then
+    die "Remote-to-remote transfers are not supported. Pull locally first, then push."
+  fi
+
+  if [[ "$src_kind" == "local" && "$dst_kind" == "local" ]]; then
+    die "Source and destination are both local. Refusing transfer-to-self."
+  fi
+
+  if [[ "$src_kind" == "local" && "$dst_kind" == "remote" ]]; then
+    machine_reachable "$dst_machine" || die "Destination '$dst_machine' is not reachable from '$THIS_MACHINE'. Allowed: $CAN_SSH_TO"
+    remote_machine="$dst_machine"
+    direction="push"
+    resolved_source="$(expand_tilde "$src_path")"
+    resolved_destination="$(resolve_remote_spec "$dst_machine" "$dst_path")"
+  elif [[ "$src_kind" == "remote" && "$dst_kind" == "local" ]]; then
+    machine_reachable "$src_machine" || die "Source '$src_machine' is not reachable from '$THIS_MACHINE'. Allowed: $CAN_SSH_TO"
+    remote_machine="$src_machine"
+    direction="pull"
+    resolved_source="$(resolve_remote_spec "$src_machine" "$src_path")"
+    resolved_destination="$(expand_tilde "$dst_path")"
+  else
+    die "Unsupported transfer scenario"
+  fi
+
+  GIT_EXCLUDE_FROM_FILE=""
+  cleanup_git_exclude=false
+  if [[ "$GIT_IGNORE" == true ]]; then
+    if [[ "$direction" == "push" ]]; then
+      root_dir="${resolved_source%/}"
+      if [[ -d "$root_dir" ]]; then
+        gitignore_path="$root_dir/.gitignore"
+        GIT_EXCLUDE_FROM_FILE="$(gitignore_prepare_exclude_file_local "$gitignore_path")" || return 1
+        [[ -n "$GIT_EXCLUDE_FROM_FILE" ]] && cleanup_git_exclude=true
+      fi
+    elif [[ "$direction" == "pull" ]]; then
+      remote_gitignore_content=""
+      if remote_gitignore_content="$(fetch_remote_gitignore "$src_machine" "$src_path")"; then
+        if [[ -n "$remote_gitignore_content" ]]; then
+          GIT_EXCLUDE_FROM_FILE="$(printf '%s' "$remote_gitignore_content" | gitignore_write_exclude_file_from_stdin)" || return 1
+          [[ -n "$GIT_EXCLUDE_FROM_FILE" ]] && cleanup_git_exclude=true
+        fi
+      else
+        die "Failed to read remote .gitignore from '$src_machine:$src_path'"
+      fi
+    fi
+  fi
+
+  print_info "$THIS_MACHINE -> ${remote_machine:-local} ($direction): $source -> $destination"
+
+  build_rsync_cmd "$remote_machine" "$resolved_source" "$resolved_destination"
+
+  if [[ "$VERBOSE" == true || "$DRY_RUN" == true ]]; then
+    print_verbose_command "${BUILT_CMD[@]}"
+  fi
+
+  rsync_log="$(mktemp)"
+  start_time="$(date +%s)"
+  if [[ "$QUIET" == true ]]; then
+    "${BUILT_CMD[@]}" >"$rsync_log" 2> >(tee -a "$rsync_log" >&2)
+  else
+    "${BUILT_CMD[@]}" > >(tee "$rsync_log") 2> >(tee -a "$rsync_log" >&2)
+  fi
+  rsync_exit=$?
+  end_time="$(date +%s)"
+  duration=$((end_time - start_time))
+
+  extract_transfer_stats "$rsync_log"
+  rm -f "$rsync_log"
+  if [[ "$cleanup_git_exclude" == true && -n "${GIT_EXCLUDE_FROM_FILE:-}" ]]; then
+    rm -f "$GIT_EXCLUDE_FROM_FILE" 2>/dev/null || true
+  fi
+
+  map_rsync_exit "$rsync_exit"
+
+  if [[ "$DRY_RUN" != true ]]; then
+    flags_b64="$(encode_flags_b64 "${TRANSFER_RAW_FLAGS[@]}")"
+    record_history "$MAPPED_STATUS" "$source" "$destination" "$STATS_FILES" "$STATS_BYTES" "${duration}s" "$flags_b64"
+  fi
+
+  case "$MAPPED_STATUS" in
+    OK)
+      print_info "status=OK files=$STATS_FILES bytes=$STATS_BYTES duration=${duration}s"
+      ;;
+    PARTIAL)
+      print_warn "status=PARTIAL (rsync exit 23) files=$STATS_FILES bytes=$STATS_BYTES duration=${duration}s"
+      ;;
+    FAIL)
+      print_error "status=FAIL (rsync exit $rsync_exit) files=$STATS_FILES bytes=$STATS_BYTES duration=${duration}s"
+      ;;
+  esac
+
+  return "$MAPPED_EXIT"
+}
+
+parse_transfer_args() {
+  local -a positional=()
+
+  DRY_RUN=false
+  VERBOSE=false
+  QUIET=false
+  NO_PROGRESS=false
+  UPDATE=false
+  GIT_IGNORE=false
+  EXCLUDES=()
+  EXCLUDE_PROFILES=()
+  TRANSFER_RAW_FLAGS=()
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -n|--dry-run)
+        DRY_RUN=true
+        TRANSFER_RAW_FLAGS+=("$1")
+        ;;
+      -v|--verbose)
+        VERBOSE=true
+        TRANSFER_RAW_FLAGS+=("$1")
+        ;;
+      -q|--quiet)
+        QUIET=true
+        TRANSFER_RAW_FLAGS+=("$1")
+        ;;
+      --no-progress)
+        NO_PROGRESS=true
+        TRANSFER_RAW_FLAGS+=("$1")
+        ;;
+      --progress)
+        NO_PROGRESS=false
+        TRANSFER_RAW_FLAGS+=("$1")
+        ;;
+      --update)
+        UPDATE=true
+        TRANSFER_RAW_FLAGS+=("$1")
+        ;;
+      --git)
+        GIT_IGNORE=true
+        TRANSFER_RAW_FLAGS+=("$1")
+        ;;
+      --exclude)
+        [[ $# -ge 2 ]] || die "--exclude requires a pattern"
+        EXCLUDES+=("$2")
+        TRANSFER_RAW_FLAGS+=("$1" "$2")
+        shift
+        ;;
+      --exclude=*)
+        EXCLUDES+=("${1#*=}")
+        TRANSFER_RAW_FLAGS+=("$1")
+        ;;
+      -ep|--exclude-profile)
+        [[ $# -ge 2 ]] || die "$1 requires a profile name"
+        EXCLUDE_PROFILES+=("$2")
+        TRANSFER_RAW_FLAGS+=("$1" "$2")
+        shift
+        ;;
+      --exclude-profile=*)
+        EXCLUDE_PROFILES+=("${1#*=}")
+        TRANSFER_RAW_FLAGS+=("$1")
+        ;;
+      -h|--help)
+        print_transfer_help
+        exit 0
+        ;;
+      --)
+        shift
+        while [[ $# -gt 0 ]]; do
+          positional+=("$1")
+          shift
+        done
+        break
+        ;;
+      -*)
+        die "Unknown transfer flag: $1"
+        ;;
+      *)
+        positional+=("$1")
+        ;;
+    esac
+    shift
+  done
+
+  [[ ${#positional[@]} -eq 2 ]] || die "Transfer requires <source> <destination>"
+  SOURCE_ENDPOINT="${positional[0]}"
+  DEST_ENDPOINT="${positional[1]}"
+}
+
+cmd_transfer() {
+  local src_kind=""
+  local dst_kind=""
+  local dst_path=""
+  local -a targets=()
+  local target=""
+  local target_dst=""
+  local result=0
+  local ok_count=0
+  local partial_count=0
+  local fail_count=0
+
+  load_config
+  ensure_runtime_requirements
+  parse_transfer_args "$@"
+
+  parse_endpoint "$SOURCE_ENDPOINT"
+  src_kind="$PARSED_KIND"
+
+  if [[ "$src_kind" == "multi" ]]; then
+    die "Cannot use all: as a source"
+  fi
+
+  parse_endpoint "$DEST_ENDPOINT"
+  dst_kind="$PARSED_KIND"
+  dst_path="$PARSED_PATH"
+
+  if [[ "$dst_kind" == "multi" ]]; then
+    [[ "$src_kind" == "local" ]] || die "Broadcast destination requires a local source"
+    targets=("${PARSED_TARGETS[@]}")
+
+    [[ ${#targets[@]} -gt 0 ]] || die "No target machines resolved"
+
+    for target in "${targets[@]}"; do
+      machine_reachable "$target" || die "Destination '$target' is not reachable from '$THIS_MACHINE'. Allowed: $CAN_SSH_TO"
+    done
+
+    for target in "${targets[@]}"; do
+      target_dst="$target:$dst_path"
+      execute_transfer_pair "$SOURCE_ENDPOINT" "$target_dst"
+      result=$?
+      case "$result" in
+        0) ((ok_count += 1)) ;;
+        23) ((partial_count += 1)) ;;
+        *) ((fail_count += 1)) ;;
+      esac
+    done
+
+    print_info "broadcast summary: OK=$ok_count PARTIAL=$partial_count FAIL=$fail_count (${#targets[@]} total)"
+
+    if [[ "$fail_count" -gt 0 ]]; then
+      return 1
+    fi
+    if [[ "$partial_count" -gt 0 ]]; then
+      return 23
+    fi
+    return 0
+  fi
+
+  execute_transfer_pair "$SOURCE_ENDPOINT" "$DEST_ENDPOINT"
+}
+
+print_transfer_help() {
+  cat <<'HELP'
+Usage:
+  xfer [FLAGS] <source> <destination>
+
+Transfer flags:
+  -n, --dry-run                 Show what would transfer without doing it
+  --git                         Exclude patterns from top-level .gitignore only (no nested; '!' errors)
+  --exclude <pattern>           Exclude matching files (repeatable)
+  -ep, --exclude-profile <name> Use a named exclude profile (repeatable)
+  --progress / --no-progress    Toggle progress output (default: progress on)
+  --update                      Skip files newer on destination
+  -v, --verbose                 Show the rsync command
+  -q, --quiet                   Suppress output except errors
+  -h, --help                    Show transfer help
+
+Endpoint format:
+  ./path, /path, ~/path         Local
+  machine:path                  Remote
+  all:path                      Broadcast destination to all other machines
+  m1,m2:path                    Broadcast destination to listed machines
+
+Notes:
+  - all: is not valid as a source
+  - remote-to-remote is not supported
+  - if an endpoint contains ':' and is local, prefix it with ./, /, or ~
+HELP
+}
+
+print_help() {
+  local machine_list=""
+  local profile_list=""
+
+  if [[ -f "$(expand_tilde "$CONFIG_PATH")" ]]; then
+    load_config
+    machine_list="$(available_machines_csv)"
+    if [[ -d "$EXCLUDE_PROFILES_DIR" ]]; then
+      profile_list="$(ls -1 "$EXCLUDE_PROFILES_DIR" 2>/dev/null | tr '\n' ' ')"
+    fi
+  fi
+
+  cat <<HELP
+xfer $VERSION
+
+Usage:
+  xfer [FLAGS] <source> <destination>
+  xfer <subcommand> [args]
+
+Subcommands:
+  ls <machine:path>             List files on a remote machine
+  diff <source> <destination>   Compare two endpoints (dry-run itemized)
+  history [N]                   Show last N history entries (default: 10)
+  last                          Repeat the most recent history entry
+  undo                          Reverse-sync most recent OK/PARTIAL transfer
+  doctor|doc [--fix] [--yes]    Diagnose config/environment and optionally fix local issues
+  bookmark <action> ...         Save/run/list/delete bookmarks
+
+Global flags:
+  --config <path>               Use alternate config file
+  --version                     Show version
+  -h, --help                    Show help
+
+Transfer flags:
+  -n, --dry-run
+  --git
+  --exclude <pattern>
+  -ep, --exclude-profile <name>
+  --progress / --no-progress
+  -v, --verbose
+  -q, --quiet
+
+Configured machines: ${machine_list:-<not loaded>}
+Exclude profiles: ${profile_list:-<none detected>}
+HELP
+}
+
+print_ls_help() {
+  cat <<'HELP'
+Usage:
+  xfer ls <machine:path>
+
+Lists remote directory contents with:
+  ls -ltAh <path>
+HELP
+}
+
+print_diff_help() {
+  cat <<'HELP'
+Usage:
+  xfer diff [FLAGS] <source> <destination>
+
+Diff flags:
+  --git                         Exclude patterns from top-level .gitignore only (no nested; '!' errors)
+  --exclude <pattern>
+  -ep, --exclude-profile <name>
+  --progress / --no-progress
+  -v, --verbose
+  -q, --quiet
+
+Constraints:
+  - remote-to-remote diff is not supported
+  - local-to-local diff is allowed
+HELP
+}
+
+print_history_help() {
+  cat <<'HELP'
+Usage:
+  xfer history [N]
+
+Show the last N transfers (default: 10).
+HELP
+}
+
+print_last_help() {
+  cat <<'HELP'
+Usage:
+  xfer last
+
+Replay the most recent history entry (OK, PARTIAL, or FAIL).
+HELP
+}
+
+print_undo_help() {
+  cat <<'HELP'
+Usage:
+  xfer undo
+
+Reverse-sync the most recent OK/PARTIAL entry (adds --update).
+HELP
+}
+
+print_doctor_help() {
+  cat <<'HELP'
+Usage:
+  xfer doctor [--fix] [--yes]
+
+Diagnose local xfer setup, connectivity, and remote rsync availability.
+
+Options:
+  --fix   Apply safe local fixes (directories, config mode, default profiles, history file)
+  --yes   Run --fix without interactive confirmation
+  -h, --help
+
+Exit codes:
+  0 = all checks pass
+  1 = one or more FAIL checks
+HELP
+}
+
+print_diff_item_line() {
+  local line="$1"
+  if [[ "$line" == ">f+++++++"* || "$line" == "c"*"+++++++"* ]]; then
+    printf '%s%s%s\n' "$C_GREEN" "$line" "$C_RESET"
+  elif [[ "$line" == "*deleting "* ]]; then
+    printf '%s%s%s\n' "$C_RED" "$line" "$C_RESET"
+  elif [[ "$line" == ">"* || "$line" == "c"* ]]; then
+    printf '%s%s%s\n' "$C_YELLOW" "$line" "$C_RESET"
+  else
+    printf '%s\n' "$line"
+  fi
+}
+
+remote_path_for_ls() {
+  local raw_path="$1"
+  local safe_tail=""
+
+  if [[ -z "$raw_path" || "$raw_path" == "~" || "$raw_path" == "~/" ]]; then
+    printf '%s\n' '\$HOME'
+    return
+  fi
+
+  if [[ "$raw_path" == "~/"* ]]; then
+    safe_tail="$(printf '%q' "${raw_path#"~/"}")"
+    printf '%s\n' "\$HOME/$safe_tail"
+    return
+  fi
+
+  printf '%q\n' "$raw_path"
+}
+
+cmd_ls() {
+  local endpoint="${1:-}"
+  local machine=""
+  local path=""
+  local user=""
+  local ip=""
+  local key=""
+  local safe_path=""
+  local -a ssh_cmd=(ssh)
+
+  [[ -n "$endpoint" ]] || die "xfer ls requires an endpoint"
+  if [[ "$endpoint" == "-h" || "$endpoint" == "--help" ]]; then
+    print_ls_help
+    return 0
+  fi
+
+  load_config
+  ensure_runtime_requirements
+
+  parse_endpoint "$endpoint"
+  [[ "$PARSED_KIND" == "remote" ]] || die "xfer ls requires a remote endpoint (machine:path)"
+
+  machine="$PARSED_MACHINE"
+  path="$PARSED_PATH"
+
+  machine_reachable "$machine" || die "Machine '$machine' is not reachable from '$THIS_MACHINE'. Allowed: $CAN_SSH_TO"
+
+  user="$(machine_field "$machine" user)"
+  ip="$(machine_field "$machine" ip)"
+  key="$(resolve_ssh_key "$machine")"
+
+  [[ -n "$user" ]] || die "Missing config value: ${machine}_user"
+  [[ -n "$ip" ]] || die "Missing config value: ${machine}_ip"
+
+  if [[ -n "$key" ]]; then
+    [[ -f "$key" ]] || die "SSH key not found for '$machine': $key"
+    ssh_cmd+=(-i "$key")
+  fi
+
+  ssh_cmd+=("$user@$ip")
+  safe_path="$(remote_path_for_ls "$path")"
+
+  "${ssh_cmd[@]}" "ls -ltAh $safe_path"
+}
+
+parse_diff_args() {
+  local -a positional=()
+
+  DRY_RUN=true
+  VERBOSE=false
+  QUIET=false
+  NO_PROGRESS=false
+  GIT_IGNORE=false
+  EXCLUDES=()
+  EXCLUDE_PROFILES=()
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -v|--verbose)
+        VERBOSE=true
+        ;;
+      -q|--quiet)
+        QUIET=true
+        ;;
+      --no-progress)
+        NO_PROGRESS=true
+        ;;
+      --progress)
+        NO_PROGRESS=false
+        ;;
+      --git)
+        GIT_IGNORE=true
+        ;;
+      --exclude)
+        [[ $# -ge 2 ]] || die "--exclude requires a pattern"
+        EXCLUDES+=("$2")
+        shift
+        ;;
+      --exclude=*)
+        EXCLUDES+=("${1#*=}")
+        ;;
+      -ep|--exclude-profile)
+        [[ $# -ge 2 ]] || die "$1 requires a profile name"
+        EXCLUDE_PROFILES+=("$2")
+        shift
+        ;;
+      --exclude-profile=*)
+        EXCLUDE_PROFILES+=("${1#*=}")
+        ;;
+      -h|--help)
+        print_diff_help
+        exit 0
+        ;;
+      --)
+        shift
+        while [[ $# -gt 0 ]]; do
+          positional+=("$1")
+          shift
+        done
+        break
+        ;;
+      -*)
+        die "Unknown diff flag: $1"
+        ;;
+      *)
+        positional+=("$1")
+        ;;
+    esac
+    shift
+  done
+
+  [[ ${#positional[@]} -eq 2 ]] || die "xfer diff requires <source> <destination>"
+  SOURCE_ENDPOINT="${positional[0]}"
+  DEST_ENDPOINT="${positional[1]}"
+}
+
+cmd_diff() {
+  local src_kind=""
+  local src_machine=""
+  local src_path=""
+  local dst_kind=""
+  local dst_machine=""
+  local dst_path=""
+  local resolved_source=""
+  local resolved_destination=""
+  local remote_machine=""
+  local profile=""
+  local profile_path=""
+  local pattern=""
+  local arg=""
+  local -a cmd=(rsync)
+  local -a defaults=()
+  local rsync_exit=0
+  local diff_log=""
+  local line=""
+  local cleanup_git_exclude=false
+  local root_dir=""
+  local gitignore_path=""
+  local remote_gitignore_content=""
+
+  load_config
+  ensure_runtime_requirements
+  parse_diff_args "$@"
+
+  parse_endpoint "$SOURCE_ENDPOINT"
+  src_kind="$PARSED_KIND"
+  src_machine="$PARSED_MACHINE"
+  src_path="$PARSED_PATH"
+
+  parse_endpoint "$DEST_ENDPOINT"
+  dst_kind="$PARSED_KIND"
+  dst_machine="$PARSED_MACHINE"
+  dst_path="$PARSED_PATH"
+
+  [[ "$src_kind" != "multi" ]] || die "all: is not valid as a diff source"
+  [[ "$dst_kind" != "multi" ]] || die "all: is not valid as a diff destination"
+
+  if [[ "$src_kind" == "remote" && "$dst_kind" == "remote" ]]; then
+    die "Remote-to-remote diff is not supported. Pull one side locally first."
+  fi
+
+  if [[ "$src_kind" == "remote" ]]; then
+    machine_reachable "$src_machine" || die "Machine '$src_machine' is not reachable from '$THIS_MACHINE'. Allowed: $CAN_SSH_TO"
+    remote_machine="$src_machine"
+    resolved_source="$(resolve_remote_spec "$src_machine" "$src_path")"
+    resolved_destination="$(expand_tilde "$dst_path")"
+  elif [[ "$dst_kind" == "remote" ]]; then
+    machine_reachable "$dst_machine" || die "Machine '$dst_machine' is not reachable from '$THIS_MACHINE'. Allowed: $CAN_SSH_TO"
+    remote_machine="$dst_machine"
+    resolved_source="$(expand_tilde "$src_path")"
+    resolved_destination="$(resolve_remote_spec "$dst_machine" "$dst_path")"
+  else
+    resolved_source="$(expand_tilde "$src_path")"
+    resolved_destination="$(expand_tilde "$dst_path")"
+  fi
+
+  read -r -a defaults <<< "$RSYNC_DEFAULT_FLAGS"
+  cmd+=("${defaults[@]}")
+
+  if [[ "$NO_PROGRESS" == true ]]; then
+    local -a filtered=()
+    for arg in "${cmd[@]}"; do
+      [[ "$arg" == "--progress" ]] && continue
+      filtered+=("$arg")
+    done
+    cmd=("${filtered[@]}")
+  fi
+
+  cmd+=(--dry-run --itemize-changes)
+  [[ "$QUIET" == true ]] && cmd+=(--quiet)
+
+  GIT_EXCLUDE_FROM_FILE=""
+  cleanup_git_exclude=false
+  if [[ "$GIT_IGNORE" == true ]]; then
+    if [[ "$src_kind" == "local" ]]; then
+      root_dir="$(expand_tilde "$src_path")"
+      root_dir="${root_dir%/}"
+      if [[ -d "$root_dir" ]]; then
+        gitignore_path="$root_dir/.gitignore"
+        GIT_EXCLUDE_FROM_FILE="$(gitignore_prepare_exclude_file_local "$gitignore_path")" || return 1
+        [[ -n "$GIT_EXCLUDE_FROM_FILE" ]] && cleanup_git_exclude=true
+      fi
+    else
+      remote_gitignore_content=""
+      if remote_gitignore_content="$(fetch_remote_gitignore "$src_machine" "$src_path")"; then
+        if [[ -n "$remote_gitignore_content" ]]; then
+          GIT_EXCLUDE_FROM_FILE="$(printf '%s' "$remote_gitignore_content" | gitignore_write_exclude_file_from_stdin)" || return 1
+          [[ -n "$GIT_EXCLUDE_FROM_FILE" ]] && cleanup_git_exclude=true
+        fi
+      else
+        die "Failed to read remote .gitignore from '$src_machine:$src_path'"
+      fi
+    fi
+  fi
+
+  if [[ -n "${GIT_EXCLUDE_FROM_FILE:-}" ]]; then
+    cmd+=(--exclude-from="$GIT_EXCLUDE_FROM_FILE")
+  fi
+
+  for profile in "${EXCLUDE_PROFILES[@]}"; do
+    profile_path="$EXCLUDE_PROFILES_DIR/$profile"
+    [[ -f "$profile_path" ]] || die "Exclude profile not found: $profile. Available profiles: $(available_exclude_profiles_csv)"
+    cmd+=(--exclude-from="$profile_path")
+  done
+
+  for pattern in "${EXCLUDES[@]}"; do
+    cmd+=(--exclude="$pattern")
+  done
+
+  if [[ -n "$remote_machine" ]]; then
+    local key
+    key="$(resolve_ssh_key "$remote_machine")"
+    if [[ -n "$key" ]]; then
+      [[ -f "$key" ]] || die "SSH key not found for '$remote_machine': $key"
+      cmd+=(-e "ssh -i $key")
+    fi
+  fi
+
+  cmd+=("$resolved_source" "$resolved_destination")
+
+  if [[ "$VERBOSE" == true ]]; then
+    print_verbose_command "${cmd[@]}"
+  fi
+
+  diff_log="$(mktemp)"
+  "${cmd[@]}" >"$diff_log"
+  rsync_exit=$?
+  if [[ "$QUIET" != true ]]; then
+    while IFS= read -r line; do
+      print_diff_item_line "$line"
+    done < "$diff_log"
+  fi
+  rm -f "$diff_log"
+  if [[ "$cleanup_git_exclude" == true && -n "${GIT_EXCLUDE_FROM_FILE:-}" ]]; then
+    rm -f "$GIT_EXCLUDE_FROM_FILE" 2>/dev/null || true
+  fi
+
+  map_rsync_exit "$rsync_exit"
+
+  case "$MAPPED_STATUS" in
+    OK)
+      return 0
+      ;;
+    PARTIAL)
+      return 23
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+cmd_history() {
+  local count="${1:-10}"
+  local ts=""
+  local status=""
+  local src=""
+  local dst=""
+  local files=""
+  local bytes=""
+  local duration=""
+  local flags_b64=""
+  local pretty_flags=""
+
+  if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+    print_history_help
+    return 0
+  fi
+  [[ $# -le 1 ]] || die "Usage: xfer history [N]"
+
+  load_config
+
+  if [[ ! -f "$HISTORY_FILE" ]]; then
+    print_info "No transfer history yet."
+    return 0
+  fi
+
+  if ! [[ "$count" =~ ^[0-9]+$ ]]; then
+    die "history count must be numeric"
+  fi
+
+  printf '%-20s %-7s %-30s %-30s %-8s %s\n' "WHEN" "STATUS" "FROM" "TO" "SIZE" "FLAGS"
+  while IFS=$'\t' read -r ts status src dst files bytes duration flags_b64; do
+    pretty_flags="$(decode_flags_b64_pretty "$flags_b64")"
+    printf '%-20s %-7s %-30s %-30s %-8s %s\n' "$ts" "$status" "$src" "$dst" "$bytes" "$pretty_flags"
+  done < <(tail -n "$count" "$HISTORY_FILE")
+}
+
+cmd_last() {
+  if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+    print_last_help
+    return 0
+  fi
+  [[ $# -eq 0 ]] || die "Usage: xfer last"
+
+  local line=""
+  local ts=""
+  local status=""
+  local src=""
+  local dst=""
+  local files=""
+  local bytes=""
+  local duration=""
+  local flags_b64=""
+
+  load_config
+
+  [[ -f "$HISTORY_FILE" ]] || die "No transfer history yet."
+  line="$(tail -n 1 "$HISTORY_FILE")"
+  [[ -n "$line" ]] || die "No transfer history yet."
+
+  IFS=$'\t' read -r ts status src dst files bytes duration flags_b64 <<< "$line"
+  [[ -n "$src" && -n "$dst" ]] || die "Malformed history entry"
+
+  if ! decode_flags_b64_to_array "$flags_b64"; then
+    die "Failed to decode stored flags in history"
+  fi
+
+  print_info "Repeating last transfer: $src -> $dst"
+  cmd_transfer "${DECODED_FLAGS[@]}" "$src" "$dst"
+}
+
+cmd_undo() {
+  if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+    print_undo_help
+    return 0
+  fi
+  [[ $# -eq 0 ]] || die "Usage: xfer undo"
+
+  local line=""
+  local found=false
+  local ts=""
+  local status=""
+  local src=""
+  local dst=""
+  local files=""
+  local bytes=""
+  local duration=""
+  local flags_b64=""
+  local response=""
+
+  load_config
+
+  [[ -f "$HISTORY_FILE" ]] || die "No transfer history yet."
+
+  while IFS=$'\t' read -r ts status src dst files bytes duration flags_b64; do
+    if [[ "$status" == "OK" || "$status" == "PARTIAL" ]]; then
+      found=true
+      break
+    fi
+  done < <(tac "$HISTORY_FILE")
+
+  [[ "$found" == true ]] || die "No reversible history entry found (need OK or PARTIAL)."
+
+  if ! decode_flags_b64_to_array "$flags_b64"; then
+    die "Failed to decode stored flags in history"
+  fi
+
+  print_warn "Note: undo is a reverse sync, not a true rollback."
+  print_info "Reverse sync: $dst -> $src (adds --update)"
+  printf 'Continue? [y/N] '
+  read -r response
+  case "$response" in
+    y|Y|yes|YES)
+      ;;
+    *)
+      print_info "Undo cancelled."
+      return 0
+      ;;
+  esac
+
+  cmd_transfer "${DECODED_FLAGS[@]}" --update "$dst" "$src"
+}
+
+doctor_ensure_dir() {
+  local label="$1"
+  local dir_path="$2"
+  local apply_fixes="$3"
+
+  if [[ -d "$dir_path" ]]; then
+    doctor_ok "$label exists: $dir_path"
+    return 0
+  fi
+
+  if [[ "$apply_fixes" == true ]]; then
+    if mkdir -p "$dir_path"; then
+      doctor_fixed "$label created: $dir_path"
+      return 0
+    fi
+  fi
+
+  doctor_fail_msg "$label missing: $dir_path"
+  return 1
+}
+
+doctor_ensure_file() {
+  local label="$1"
+  local file_path="$2"
+  local apply_fixes="$3"
+
+  if [[ -f "$file_path" ]]; then
+    doctor_ok "$label exists: $file_path"
+    return 0
+  fi
+
+  if [[ "$apply_fixes" == true ]]; then
+    if : > "$file_path"; then
+      doctor_fixed "$label created: $file_path"
+      return 0
+    fi
+  fi
+
+  doctor_fail_msg "$label missing: $file_path"
+  return 1
+}
+
+doctor_write_default_profile() {
+  local profile_name="$1"
+  local profile_path="$2"
+
+  case "$profile_name" in
+    dev)
+      cat > "$profile_path" <<'PROFILE'
+node_modules
+.git
+__pycache__
+.venv
+*.pyc
+dist
+build
+.next
+.cache
+.tox
+*.egg-info
+PROFILE
+      ;;
+    media)
+      cat > "$profile_path" <<'PROFILE'
+*.mp4
+*.mkv
+*.avi
+*.mov
+*.iso
+*.zip
+*.tar.gz
+*.rar
+PROFILE
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+  return 0
+}
+
+doctor_ensure_default_profile() {
+  local profile_name="$1"
+  local apply_fixes="$2"
+  local profile_path="$EXCLUDE_PROFILES_DIR/$profile_name"
+
+  if [[ -f "$profile_path" ]]; then
+    doctor_ok "exclude profile '$profile_name' exists"
+    return 0
+  fi
+
+  if [[ "$apply_fixes" == true ]]; then
+    if doctor_write_default_profile "$profile_name" "$profile_path"; then
+      doctor_fixed "exclude profile '$profile_name' created"
+      return 0
+    fi
+  fi
+
+  doctor_fail_msg "exclude profile '$profile_name' missing"
+  return 1
+}
+
+doctor_check_config_mode() {
+  local apply_fixes="$1"
+  local mode=""
+
+  if [[ ! -f "$CONFIG_PATH" ]]; then
+    doctor_fail_msg "config file missing: $CONFIG_PATH"
+    return 1
+  fi
+
+  mode="$(stat -c '%a' "$CONFIG_PATH" 2>/dev/null || true)"
+  if [[ "$mode" == "600" ]]; then
+    doctor_ok "config permissions are 600"
+    return 0
+  fi
+
+  if [[ "$apply_fixes" == true ]]; then
+    if chmod 600 "$CONFIG_PATH"; then
+      doctor_fixed "config permissions set to 600"
+      return 0
+    fi
+  fi
+
+  doctor_fail_msg "config permissions should be 600 (current: ${mode:-unknown})"
+  return 1
+}
+
+doctor_check_required_commands() {
+  local cmd=""
+  local -a required=(bash rsync ssh flock base64)
+
+  for cmd in "${required[@]}"; do
+    if command_exists "$cmd"; then
+      doctor_ok "required command available: $cmd"
+    else
+      doctor_fail_msg "required command missing: $cmd"
+    fi
+  done
+}
+
+doctor_check_config_semantics() {
+  local machine=""
+
+  if [[ ${#CAN_SSH_TO_ARR[@]} -eq 0 ]]; then
+    doctor_fail_msg "CAN_SSH_TO has no reachable targets"
+  else
+    doctor_ok "CAN_SSH_TO has targets: $CAN_SSH_TO"
+  fi
+
+  for machine in "${CAN_SSH_TO_ARR[@]}"; do
+    if ! machine_exists "$machine"; then
+      doctor_fail_msg "CAN_SSH_TO contains unknown machine: $machine"
+      continue
+    fi
+    if [[ "$machine" == "$THIS_MACHINE" ]]; then
+      doctor_fail_msg "CAN_SSH_TO should not include THIS_MACHINE ($THIS_MACHINE)"
+      continue
+    fi
+    doctor_ok "reachable machine configured: $machine"
+  done
+}
+
+doctor_check_history_and_bookmarks() {
+  local line_no=0
+  local ts=""
+  local status=""
+  local src=""
+  local dst=""
+  local files=""
+  local bytes=""
+  local duration=""
+  local flags_b64=""
+  local bookmark_file=""
+  local bookmark_name=""
+  local has_bookmark=false
+
+  if [[ -f "$HISTORY_FILE" ]]; then
+    while IFS=$'\t' read -r ts status src dst files bytes duration flags_b64; do
+      line_no=$((line_no + 1))
+      if [[ -z "$ts" || -z "$status" || -z "$src" || -z "$dst" || -z "$duration" ]]; then
+        doctor_fail_msg "history line $line_no malformed"
+        return 1
+      fi
+      if [[ -n "$flags_b64" ]] && command_exists base64 && ! decode_flags_b64_to_array "$flags_b64"; then
+        doctor_fail_msg "history line $line_no has invalid encoded flags"
+        return 1
+      fi
+    done < "$HISTORY_FILE"
+    doctor_ok "history file format is valid"
+  fi
+
+  for bookmark_file in "$BOOKMARKS_DIR"/*; do
+    [[ -f "$bookmark_file" ]] || continue
+    bookmark_name="$(basename "$bookmark_file")"
+    [[ "$bookmark_name" == ".lock" ]] && continue
+    has_bookmark=true
+
+    {
+      read -r src || true
+      read -r dst || true
+      read -r flags_b64 || true
+    } < "$bookmark_file"
+
+    if [[ -z "$src" || -z "$dst" ]]; then
+      doctor_fail_msg "bookmark '$bookmark_name' is malformed"
+      return 1
+    fi
+    if [[ -n "$flags_b64" ]] && command_exists base64 && ! decode_flags_b64_to_array "$flags_b64"; then
+      doctor_fail_msg "bookmark '$bookmark_name' has invalid encoded flags"
+      return 1
+    fi
+  done
+
+  if [[ "$has_bookmark" == true ]]; then
+    doctor_ok "bookmark files are well-formed"
+  else
+    doctor_warn "no bookmarks saved yet"
+  fi
+
+  return 0
+}
+
+doctor_check_remote_connectivity() {
+  local machine=""
+  local user=""
+  local ip=""
+  local key=""
+  local -a ssh_cmd=()
+
+  if ! command_exists ssh; then
+    doctor_fail_msg "ssh command is missing; remote checks cannot run"
+    return 1
+  fi
+
+  for machine in "${CAN_SSH_TO_ARR[@]}"; do
+    machine_exists "$machine" || continue
+
+    user="$(machine_field "$machine" user)"
+    ip="$(machine_field "$machine" ip)"
+    key="$(resolve_ssh_key "$machine")"
+
+    if [[ -z "$user" || -z "$ip" ]]; then
+      doctor_fail_msg "missing user/ip for reachable machine '$machine'"
+      continue
+    fi
+
+    ssh_cmd=(ssh -o BatchMode=yes -o ConnectTimeout=5)
+    if [[ -n "$key" ]]; then
+      if [[ ! -f "$key" ]]; then
+        doctor_fail_msg "ssh key for '$machine' not found: $key"
+        continue
+      fi
+      ssh_cmd+=(-i "$key")
+      doctor_ok "ssh key file exists for '$machine'"
+    else
+      doctor_warn "no ssh key configured for '$machine' (agent/default key must work)"
+    fi
+    ssh_cmd+=("$user@$ip")
+
+    if "${ssh_cmd[@]}" true >/dev/null 2>&1; then
+      doctor_ok "ssh reachable: $machine ($user@$ip)"
+    else
+      doctor_fail_msg "ssh unreachable: $machine ($user@$ip)"
+      continue
+    fi
+
+    if "${ssh_cmd[@]}" 'command -v rsync >/dev/null 2>&1' >/dev/null 2>&1; then
+      doctor_ok "remote rsync available: $machine"
+    else
+      doctor_fail_msg "remote rsync missing on: $machine"
+    fi
+  done
+}
+
+cmd_doctor() {
+  local do_fix=false
+  local assume_yes=false
+  local apply_fixes=false
+  local config_loaded=false
+  local response=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --fix)
+        do_fix=true
+        ;;
+      --yes)
+        assume_yes=true
+        ;;
+      -h|--help)
+        print_doctor_help
+        return 0
+        ;;
+      *)
+        die "Unknown doctor option: $1"
+        ;;
+    esac
+    shift
+  done
+
+  doctor_reset_counters
+  doctor_config_paths_from_config_path
+  DATA_DIR="${DATA_DIR:-$HOME/.local/share/xfer}"
+  DATA_DIR="$(expand_tilde "$DATA_DIR")"
+  HISTORY_FILE="$DATA_DIR/history.log"
+
+  if [[ "$do_fix" == true ]]; then
+    if [[ "$assume_yes" == true ]]; then
+      apply_fixes=true
+    else
+      printf 'xfer doctor: apply automatic local fixes? [y/N] '
+      read -r response
+      case "$response" in
+        y|Y|yes|YES) apply_fixes=true ;;
+        *)
+          print_info "doctor fix actions skipped"
+          ;;
+      esac
+    fi
+  elif [[ "$assume_yes" == true ]]; then
+    doctor_warn "--yes has no effect without --fix"
+  fi
+
+  doctor_check_required_commands
+
+  if [[ -f "$CONFIG_PATH" ]]; then
+    doctor_ok "config file exists: $CONFIG_PATH"
+  else
+    doctor_fail_msg "config file missing: $CONFIG_PATH"
+  fi
+
+  if [[ -f "$CONFIG_PATH" && -r "$CONFIG_PATH" ]]; then
+    doctor_ok "config file is readable"
+  elif [[ -f "$CONFIG_PATH" ]]; then
+    doctor_fail_msg "config file is not readable"
+  fi
+
+  if doctor_try_load_config; then
+    config_loaded=true
+    doctor_ok "config parsed successfully"
+  else
+    config_loaded=false
+    doctor_fail_msg "config parse/validation failed"
+  fi
+
+  doctor_ensure_dir "config directory" "$CONFIG_DIR" "$apply_fixes"
+  doctor_ensure_dir "bookmarks directory" "$BOOKMARKS_DIR" "$apply_fixes"
+  doctor_ensure_dir "exclude-profiles directory" "$EXCLUDE_PROFILES_DIR" "$apply_fixes"
+  doctor_ensure_dir "data directory" "$DATA_DIR" "$apply_fixes"
+  doctor_ensure_file "history file" "$HISTORY_FILE" "$apply_fixes"
+  doctor_ensure_default_profile "dev" "$apply_fixes"
+  doctor_ensure_default_profile "media" "$apply_fixes"
+
+  if [[ -f "$CONFIG_PATH" ]]; then
+    doctor_check_config_mode "$apply_fixes"
+  fi
+
+  if [[ "$config_loaded" == true ]]; then
+    doctor_check_config_semantics
+    doctor_check_history_and_bookmarks
+    doctor_check_remote_connectivity
+  fi
+
+  print_info "doctor summary: checks=$DOCTOR_TOTAL ok=$DOCTOR_OK fixed=$DOCTOR_FIXED warn=$DOCTOR_WARN fail=$DOCTOR_FAIL"
+
+  if [[ "$DOCTOR_FAIL" -gt 0 ]]; then
+    return 1
+  fi
+  return 0
+}
+
+bookmark_file_for() {
+  local name="$1"
+  printf '%s/%s\n' "$BOOKMARKS_DIR" "$name"
+}
+
+validate_bookmark_name() {
+  local name="$1"
+  [[ "$name" =~ ^[a-zA-Z0-9_-]+$ ]]
+}
+
+cmd_bookmark_save() {
+  local name="$1"
+  local src="$2"
+  local dst="$3"
+  shift 3
+  local -a flag_args=("$@")
+  local flags_b64=""
+  local bookmark_file=""
+  local tmp_file=""
+
+  validate_bookmark_name "$name" || die "Invalid bookmark name '$name' (allowed: letters, digits, _, -)"
+
+  flags_b64="$(encode_flags_b64 "${flag_args[@]}")"
+  bookmark_file="$(bookmark_file_for "$name")"
+
+  (
+    flock -x 200
+    if [[ -f "$bookmark_file" ]]; then
+      print_warn "Overwriting existing bookmark: $name"
+    fi
+    tmp_file="$(mktemp "$BOOKMARKS_DIR/.${name}.tmp.XXXXXX")"
+    printf '%s\n%s\n%s\n' "$src" "$dst" "$flags_b64" > "$tmp_file"
+    mv "$tmp_file" "$bookmark_file"
+  ) 200>"$BOOKMARKS_DIR/.lock"
+
+  print_info "Saved bookmark '$name'"
+}
+
+cmd_bookmark_run() {
+  local name="$1"
+  local bookmark_file=""
+  local src=""
+  local dst=""
+  local flags_b64=""
+
+  bookmark_file="$(bookmark_file_for "$name")"
+  [[ -f "$bookmark_file" ]] || die "Bookmark not found: $name"
+
+  {
+    read -r src
+    read -r dst
+    read -r flags_b64
+  } < "$bookmark_file"
+
+  if ! decode_flags_b64_to_array "$flags_b64"; then
+    die "Bookmark '$name' has invalid encoded flags"
+  fi
+
+  print_info "Running bookmark '$name': $src -> $dst"
+  cmd_transfer "${DECODED_FLAGS[@]}" "$src" "$dst"
+}
+
+cmd_bookmark_list() {
+  local bookmark_file=""
+  local name=""
+  local src=""
+  local dst=""
+
+  local found=false
+  for bookmark_file in "$BOOKMARKS_DIR"/*; do
+    [[ -f "$bookmark_file" ]] || continue
+    found=true
+    name="$(basename "$bookmark_file")"
+    {
+      read -r src
+      read -r dst
+    } < "$bookmark_file"
+    printf '%-20s %s -> %s\n' "$name" "$src" "$dst"
+  done
+
+  if [[ "$found" == false ]]; then
+    print_info "No bookmarks saved yet."
+  fi
+}
+
+cmd_bookmark_delete() {
+  local name="$1"
+  local bookmark_file=""
+
+  bookmark_file="$(bookmark_file_for "$name")"
+
+  (
+    flock -x 200
+    [[ -f "$bookmark_file" ]] || die "Bookmark not found: $name"
+    rm "$bookmark_file"
+  ) 200>"$BOOKMARKS_DIR/.lock"
+
+  print_info "Deleted bookmark '$name'"
+}
+
+cmd_bookmark() {
+  local action="${1:-list}"
+  shift || true
+
+  load_config
+
+  case "$action" in
+    save)
+      [[ $# -ge 3 ]] || die "Usage: xfer bookmark save <name> <source> <destination> [flags]"
+      cmd_bookmark_save "$@"
+      ;;
+    run)
+      [[ $# -eq 1 ]] || die "Usage: xfer bookmark run <name>"
+      cmd_bookmark_run "$1"
+      ;;
+    list)
+      [[ $# -eq 0 ]] || die "Usage: xfer bookmark list"
+      cmd_bookmark_list
+      ;;
+    delete)
+      [[ $# -eq 1 ]] || die "Usage: xfer bookmark delete <name>"
+      cmd_bookmark_delete "$1"
+      ;;
+    -h|--help)
+      cat <<'HELP'
+Usage:
+  xfer bookmark save <name> <source> <destination> [flags]
+  xfer bookmark run <name>
+  xfer bookmark list
+  xfer bookmark delete <name>
+HELP
+      ;;
+    *)
+      die "Unknown bookmark action: $action"
+      ;;
+  esac
+}
+
+main() {
+  setup_colors
+
+  extract_global_options "$@"
+
+  if [[ ${#ARGS[@]} -eq 0 ]]; then
+    print_help
+    return 0
+  fi
+
+  case "${ARGS[0]}" in
+    --version)
+      printf '%s\n' "$VERSION"
+      ;;
+    -h|--help)
+      print_help
+      ;;
+    ls)
+      cmd_ls "${ARGS[@]:1}"
+      ;;
+    diff)
+      cmd_diff "${ARGS[@]:1}"
+      ;;
+    history)
+      cmd_history "${ARGS[@]:1}"
+      ;;
+    last)
+      cmd_last "${ARGS[@]:1}"
+      ;;
+    undo)
+      cmd_undo "${ARGS[@]:1}"
+      ;;
+    doctor)
+      cmd_doctor "${ARGS[@]:1}"
+      ;;
+    doc)
+      cmd_doctor "${ARGS[@]:1}"
+      ;;
+    docter)
+      cmd_doctor "${ARGS[@]:1}"
+      ;;
+    bookmark)
+      cmd_bookmark "${ARGS[@]:1}"
+      ;;
+    *)
+      cmd_transfer "${ARGS[@]}"
+      ;;
+  esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

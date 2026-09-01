@@ -1,0 +1,9 @@
+project_plan.md
+*.conf
+*.log
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx

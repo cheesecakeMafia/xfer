@@ -74,6 +74,7 @@ xfer -ep dev -ep media ./mixed laptop:~/mixed
 | `--progress` / `--no-progress` | | Toggle progress display (default: on for TTY) |
 | `--mirror` | | Make the destination match the source, deleting extras ([see below](#mirror-mode)) |
 | `--max-delete <n>` | | Ceiling on `--mirror` deletions (default: `MIRROR_MAX_DELETE`, 5000) |
+| `--delete-excluded` | | With `--mirror`, also delete destination paths matched by `--exclude`/`-ep` |
 | `--yes` | `-y` | Skip the mirror confirmation prompt (required when not on a TTY) |
 | `--verbose` | `-v` | Show the rsync command being executed |
 | `--quiet` | `-q` | Suppress output except errors |

@@ -1314,7 +1314,7 @@ Transfer flags:
   --mirror                      Make the destination match the source, deleting extras
   --max-delete <n>              Ceiling on --mirror deletions (default: MIRROR_MAX_DELETE, 5000)
   --delete-excluded             With --mirror, also delete excluded paths at the destination
-  -y, --yes                    Skip the mirror confirmation prompt (required when not on a TTY)
+  -y, --yes                     Skip the mirror confirmation prompt (required when not on a TTY)
   -v, --verbose                 Show the rsync command
   -q, --quiet                   Suppress output except errors
   -h, --help                    Show transfer help

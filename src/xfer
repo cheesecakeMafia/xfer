@@ -25,6 +25,7 @@ NO_PROGRESS=false
 UPDATE=false
 GIT_IGNORE=false
 MIRROR=false
+DELETE_EXCLUDED=false
 MAX_DELETE=""
 MIRROR_MAX_DELETE_DEFAULT=5000
 ASSUME_YES=false
@@ -702,6 +703,7 @@ build_rsync_cmd() {
   [[ "$UPDATE" == true ]] && cmd+=(--update)
   if [[ "$MIRROR" == true ]]; then
     cmd+=(--delete-after --max-delete="$(mirror_effective_ceiling)")
+    [[ "$DELETE_EXCLUDED" == true ]] && cmd+=(--delete-excluded)
   fi
   [[ "$QUIET" == true ]] && cmd+=(--quiet)
   [[ "$DRY_RUN" != true ]] && cmd+=(--stats)
@@ -946,7 +948,7 @@ filter_replay_flags() {
     esac
     if [[ "$mode" == "undo" ]]; then
       case "$arg" in
-        --mirror|--max-delete=*)
+        --mirror|--delete-excluded|--max-delete=*)
           continue
           ;;
         --max-delete)
@@ -1119,6 +1121,7 @@ parse_transfer_args() {
   UPDATE=false
   GIT_IGNORE=false
   MIRROR=false
+  DELETE_EXCLUDED=false
   MAX_DELETE=""
   ASSUME_YES=false
   EXCLUDES=()
@@ -1153,6 +1156,10 @@ parse_transfer_args() {
         ;;
       --mirror)
         MIRROR=true
+        TRANSFER_RAW_FLAGS+=("$1")
+        ;;
+      --delete-excluded)
+        DELETE_EXCLUDED=true
         TRANSFER_RAW_FLAGS+=("$1")
         ;;
       --max-delete)
@@ -1239,6 +1246,8 @@ cmd_transfer() {
   ensure_runtime_requirements
   parse_transfer_args "$@"
 
+  [[ "$DELETE_EXCLUDED" != true || "$MIRROR" == true ]] || die "--delete-excluded requires --mirror (rsync's --delete-excluded implies --delete)."
+
   if [[ "$MIRROR" == true ]]; then
     mirror_guard_source "$SOURCE_ENDPOINT"
   fi
@@ -1304,7 +1313,8 @@ Transfer flags:
   --update                      Skip files newer on destination
   --mirror                      Make the destination match the source, deleting extras
   --max-delete <n>              Ceiling on --mirror deletions (default: MIRROR_MAX_DELETE, 5000)
-  -y, --yes                     Skip the mirror confirmation prompt (required when not on a TTY)
+  --delete-excluded             With --mirror, also delete excluded paths at the destination
+  -y, --yes                    Skip the mirror confirmation prompt (required when not on a TTY)
   -v, --verbose                 Show the rsync command
   -q, --quiet                   Suppress output except errors
   -h, --help                    Show transfer help
@@ -1318,6 +1328,7 @@ Endpoint format:
 Mirror mode (--mirror):
   Makes the destination match the source exactly. Extra files at the
   destination are DELETED OUTRIGHT - there is no attic and no undo.
+  --delete-excluded also removes destination paths matched by --exclude/-ep.
   Guards, all of which must be satisfied:
     - refuses a source naming a directory's contents ('dir/', '.', 'm:~');
       pass --yes to override
@@ -1377,6 +1388,7 @@ Transfer flags:
   --progress / --no-progress
   --mirror
   --max-delete <n>
+  --delete-excluded
   -y, --yes
   -v, --verbose
   -q, --quiet

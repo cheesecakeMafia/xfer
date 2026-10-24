@@ -726,6 +726,12 @@ test_filter_replay_flags_undo() {
   contains_arg "-q" "${FILTERED_FLAGS[@]}" || return 1
   assert_eq "${#FILTERED_FLAGS[@]}" "1" || return 1
 
+  # --delete-excluded implies --delete; undo swaps endpoints, so it must go too
+  filter_replay_flags undo --mirror --delete-excluded -v
+  contains_arg "--delete-excluded" "${FILTERED_FLAGS[@]}" && return 1
+  contains_arg "-v" "${FILTERED_FLAGS[@]}" || return 1
+  assert_eq "${#FILTERED_FLAGS[@]}" "1" || return 1
+
   return 0
 }
 
@@ -916,6 +922,54 @@ test_mirror_refuses_broadcast() {
   printf '%s' "$err" | grep -qi 'broadcast'
 }
 
+test_parse_transfer_delete_excluded() {
+  parse_transfer_args --mirror --delete-excluded ./src server:~/dst
+  assert_eq "$DELETE_EXCLUDED" "true" || return 1
+  contains_arg "--delete-excluded" "${TRANSFER_RAW_FLAGS[@]}" || return 1
+
+  parse_transfer_args --mirror ./src server:~/dst
+  assert_eq "$DELETE_EXCLUDED" "false" || return 1
+}
+
+test_delete_excluded_requires_mirror() {
+  local tmp_dir=""
+  local rc=0
+  local err=""
+
+  tmp_dir="$(mktemp -d)"
+  _mirror_it_fixture "$tmp_dir"
+
+  # rsync's --delete-excluded implies --delete: without --mirror it would be an
+  # unguarded delete passthrough
+  err="$(PATH="$tmp_dir/bin:$PATH" RSYNC_CAPTURE="$tmp_dir/rsync" \
+    "$REPO_ROOT/src/xfer" --config "$tmp_dir/conf/config" --delete-excluded --yes \
+    "$tmp_dir/src" "laptop:~/dst" 2>&1)" || rc=$?
+
+  if [[ -e "$tmp_dir/rsync.all" ]]; then rm -rf "$tmp_dir"; return 1; fi
+  rm -rf "$tmp_dir"
+  [[ "$rc" -ne 0 ]] || return 1
+  printf '%s' "$err" | grep -q -- '--delete-excluded requires --mirror'
+}
+
+test_mirror_delete_excluded_in_preview_and_run() {
+  local tmp_dir=""
+  local rc=0
+  local count=""
+
+  tmp_dir="$(mktemp -d)"
+  _mirror_it_fixture "$tmp_dir"
+
+  PATH="$tmp_dir/bin:$PATH" RSYNC_CAPTURE="$tmp_dir/rsync" \
+    "$REPO_ROOT/src/xfer" --config "$tmp_dir/conf/config" --mirror --delete-excluded --yes \
+    "$tmp_dir/src" "laptop:~/dst" >/dev/null 2>&1 || rc=$?
+
+  # the preview must carry the flag too, or it under-counts excluded deletions
+  count="$(grep -cx -- '--delete-excluded' "$tmp_dir/rsync.all" || true)"
+  rm -rf "$tmp_dir"
+  [[ "$rc" -eq 0 ]] || return 1
+  assert_eq "$count" "2"
+}
+
 run_test "parse endpoint basics" test_parse_endpoint_basics
 run_test "all expands to reachable machines only" test_all_expands_to_reachable_only
 run_test "unknown machine prefix fails" test_parse_endpoint_unknown_prefix_fails
@@ -960,6 +1014,9 @@ run_test "mirror bounds real run to preview count" test_mirror_bounds_real_run_t
 run_test "mirror effective ceiling precedence" test_mirror_effective_ceiling
 run_test "mirror bound ceiling rewrite" test_mirror_bound_ceiling_to
 run_test "mirror preview strips short -q clusters" test_preview_cmd_strips_short_quiet
+run_test "transfer --delete-excluded parsing" test_parse_transfer_delete_excluded
+run_test "--delete-excluded requires --mirror" test_delete_excluded_requires_mirror
+run_test "--delete-excluded in mirror preview and run" test_mirror_delete_excluded_in_preview_and_run
 
 printf '\nTests: %d run, %d failed\n' "$TESTS_RUN" "$TESTS_FAILED"
 
